@@ -4,6 +4,102 @@
 #include "../tester/utils.h"
 
 /**
+ * @brief CUDA kernel to compute partial sums of diagonal elements for trace calculation
+ * 
+ *  
+ * @tparam T Data type of matrix elements
+ * @param input Pointer to the flattened matrix data
+ * @param partial_sums Output array to store partial sums from each thread block
+ * @param rows Number of rows in the matrix
+ * @param cols Number of columns in the matrix
+ */
+template <typename T>
+__global__ void traceKernel(const T* input, T* partial_sums, size_t rows, size_t cols) {
+    size_t min_dim = min(rows, cols);
+    
+    // Use byte-based shared memory and cast to appropriate type
+    extern __shared__ char shared_mem[];
+    T* sdata = reinterpret_cast<T*>(shared_mem);
+    
+    size_t tid = threadIdx.x;
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    T sum = 0;
+    // Each thread processes multiple elements if needed
+    for (size_t i = idx; i < min_dim; i += blockDim.x * gridDim.x) {
+        sum += input[i * (cols + 1)];  // Diagonal elements are spaced by (cols+1)
+    }
+    
+    // Store in shared memory
+    sdata[tid] = sum;
+    __syncthreads();
+    
+    // Reduce within block using shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    // Write result of this block to global memory
+    if (tid == 0) {
+        partial_sums[blockIdx.x] = sdata[0];
+    }
+}
+
+/**
+ * @brief Computes the trace of a matrix using CUDA.
+ *
+ * The trace of a matrix is defined as the sum of its diagonal elements.
+ * This function expects a flattened row-major matrix stored in device memory.
+ *
+ * @tparam T The numeric type of matrix elements (e.g., float, int).
+ * @param d_input A flattened matrix stored in device memory of size rows * cols.
+ * @param rows Number of rows in the matrix.
+ * @param cols Number of columns in the matrix.
+ * @return The trace (sum of diagonal values) of the matrix.
+ */
+template <typename T>
+T traceCuda(const T* d_input, size_t rows, size_t cols) {
+    size_t min_dim = min(rows, cols);
+    if (min_dim == 0) return T(0);
+    
+    // Configure kernel launch parameters
+    const int BLOCK_SIZE = 256;
+    const int MAX_BLOCKS = 32;
+    const int NUM_BLOCKS = min(MAX_BLOCKS, (int)((min_dim + BLOCK_SIZE - 1) / BLOCK_SIZE));
+    
+    // Allocate memory for partial sums from each block
+    T* d_partial_sums;
+    RUNTIME_CHECK(cudaMalloc(&d_partial_sums, NUM_BLOCKS * sizeof(T)));
+    
+    // Initialize partial sums to zero
+    RUNTIME_CHECK(cudaMemset(d_partial_sums, 0, NUM_BLOCKS * sizeof(T)));
+    
+    // Launch kernel to compute partial sums
+    traceKernel<<<NUM_BLOCKS, BLOCK_SIZE, BLOCK_SIZE * sizeof(T)>>>(
+        d_input, d_partial_sums, rows, cols);
+    RUNTIME_CHECK(cudaGetLastError());
+    
+    // Copy partial sums back to host
+    std::vector<T> h_partial_sums(NUM_BLOCKS);
+    RUNTIME_CHECK(cudaMemcpy(h_partial_sums.data(), d_partial_sums, 
+                             NUM_BLOCKS * sizeof(T), cudaMemcpyDeviceToHost));
+    
+    // Final reduction on CPU
+    T trace = T(0);
+    for (int i = 0; i < NUM_BLOCKS; i++) {
+        trace += h_partial_sums[i];
+    }
+    
+    // Clean up
+    RUNTIME_CHECK(cudaFree(d_partial_sums));
+    
+    return trace;
+}
+
+/**
  * @brief Computes the trace of a matrix.
  *
  * The trace of a matrix is defined as the sum of its diagonal elements.
@@ -19,8 +115,23 @@
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+    if (h_input.empty() || rows == 0 || cols == 0) return T(0);
+    
+    // Allocate device memory
+    T* d_input;
+    RUNTIME_CHECK(cudaMalloc(&d_input, h_input.size() * sizeof(T)));
+    
+    // Copy input data to device
+    RUNTIME_CHECK(cudaMemcpy(d_input, h_input.data(), 
+                             h_input.size() * sizeof(T), cudaMemcpyHostToDevice));
+    
+    // Compute trace using CUDA
+    T result = traceCuda(d_input, rows, cols);
+    
+    // Clean up
+    RUNTIME_CHECK(cudaFree(d_input));
+    
+    return result;
 }
 
 /**
