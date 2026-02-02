@@ -7,7 +7,7 @@
 
 /**
  * @brief CUDA kernel to compute partial sums of diagonal elements for trace calculation
- *
+ * Uses warp shuffle for efficient reduction within warps
  *
  * @tparam T Data type of matrix elements
  * @param input Pointer to the flattened matrix data
@@ -19,12 +19,13 @@ template <typename T>
 __global__ void traceKernel(const T* input, T* partial_sums, size_t rows, size_t cols) {
     size_t min_dim = min(rows, cols);
 
-    // Use byte-based shared memory and cast to appropriate type
-    extern __shared__ char shared_mem[];
-    T* sdata = reinterpret_cast<T*>(shared_mem);
+    // Shared memory for warp-level results
+    __shared__ T warp_sums[8];
 
     size_t tid = threadIdx.x;
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int lane = tid % 32;
+    unsigned int warp_id = tid / 32;
 
     T sum = 0;
     // Each thread processes multiple elements if needed
@@ -32,21 +33,32 @@ __global__ void traceKernel(const T* input, T* partial_sums, size_t rows, size_t
         sum += input[i * (cols + 1)];  // Diagonal elements are spaced by (cols+1)
     }
 
-    // Store in shared memory
-    sdata[tid] = sum;
-    __syncthreads();
-
-    // Reduce within block using shared memory
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
+    // Warp-level reduction using shuffle
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
     }
 
-    // Write result of this block to global memory
-    if (tid == 0) {
-        partial_sums[blockIdx.x] = sdata[0];
+    // First thread in each warp writes to shared memory
+    if (lane == 0) {
+        warp_sums[warp_id] = sum;
+    }
+    __syncthreads();
+
+    // Final reduction: first warp reduces all warp sums
+    if (warp_id == 0) {
+        // Load warp sum (only valid for threads < num_warps)
+        int num_warps = blockDim.x / 32;
+        sum = (lane < num_warps) ? warp_sums[lane] : T(0);
+
+        // Warp-level reduction
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        }
+
+        // Write result of this block to global memory
+        if (tid == 0) {
+            partial_sums[blockIdx.x] = sum;
+        }
     }
 }
 
@@ -80,7 +92,7 @@ T traceCuda(const T* d_input, size_t rows, size_t cols) {
     RUNTIME_CHECK(cudaMemset(d_partial_sums, 0, NUM_BLOCKS * sizeof(T)));
 
     // Launch kernel to compute partial sums
-    traceKernel<<<NUM_BLOCKS, BLOCK_SIZE, BLOCK_SIZE * sizeof(T)>>>(
+    traceKernel<<<NUM_BLOCKS, BLOCK_SIZE>>>(
         d_input, d_partial_sums, rows, cols);
     RUNTIME_CHECK(cudaGetLastError());
 
@@ -174,8 +186,8 @@ __global__ void flashAttentionKernel(
                    tgt_idx * query_heads * head_dim +
                    head_idx * head_dim;
 
-    // Pass 1: Find max score for numerical stability
-    float max_score = -3.4e38f;
+    // 1: Find max score for numerical stability
+    float max_score = -INFINITY;
 
     for (int src_idx = 0; src_idx < src_seq_len; src_idx++) {
         // Apply causal mask: skip future positions
@@ -195,7 +207,7 @@ __global__ void flashAttentionKernel(
         if (score > max_score) max_score = score;
     }
 
-    // Pass 2: Compute softmax and weighted sum
+    // 2: Compute softmax and weighted sum
     float sum_exp = 0.0f;
     float output[128];
     for (int d = 0; d < head_dim; d++) output[d] = 0.0f;
