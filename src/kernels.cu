@@ -76,13 +76,13 @@ __global__ void traceKernel(const T* input, T* partial_sums, size_t rows, size_t
  */
 template <typename T>
 T traceCuda(const T* d_input, size_t rows, size_t cols) {
-    size_t min_dim = min(rows, cols);
+    size_t min_dim = std::min(rows, cols);
     if (min_dim == 0) return T(0);
 
     // Configure kernel launch parameters
     const int BLOCK_SIZE = 256;
     const int MAX_BLOCKS = 32;
-    const int NUM_BLOCKS = min(MAX_BLOCKS, (int)((min_dim + BLOCK_SIZE - 1) / BLOCK_SIZE));
+    const int NUM_BLOCKS = std::min(MAX_BLOCKS, (int)((min_dim + BLOCK_SIZE - 1) / BLOCK_SIZE));
 
     // Allocate memory for partial sums from each block
     T* d_partial_sums;
